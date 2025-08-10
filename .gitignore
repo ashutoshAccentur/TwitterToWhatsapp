@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# WhatsApp Web session & local state
+.wwebjs_auth/
+seen.json
+
+# Secrets / env
+config.json
+.env
+.env.*
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Cache / temp
+tmp/
+cache/
+data/
+screenshots/
+downloads/
+.npm/
+.eslintcache
+.nyc_output/
+coverage/
+
+# OS & IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Optional: puppeteer user-data dirs if you create them
+chrome-data/
+chromium-data/
