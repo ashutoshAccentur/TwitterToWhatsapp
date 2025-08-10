@@ -1,6 +1,6 @@
 // tw2wa.js
-// Free Twitter → WhatsApp using: Nitter (RSS first), Nitter HTML, Twitter Syndication JSON fallback + whatsapp-web.js
-// Images removed; adds time/date per tweet in the WhatsApp message (IST preferred).
+// Free Twitter → WhatsApp using: Nitter (RSS first), Nitter HTML, Markdown harvest, Twitter Syndication JSON fallback + whatsapp-web.js
+// Sends image (when present) + label + IST date/time + full tweet text.
 // Install once:
 // npm i whatsapp-web.js qrcode-terminal rss-parser node-fetch@2 he node-html-parser fs-extra puppeteer
 
@@ -13,7 +13,7 @@ const fetch = require("node-fetch");          // v2 (CJS)
 const { parse: htmlParse } = require("node-html-parser");
 const he = require("he");
 const qrcode = require("qrcode-terminal");
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 
 // -------- config --------
 const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, "config.json"), "utf8"));
@@ -41,6 +41,7 @@ const POLL_MS_BASE = Math.max(20, BASE_POLL_SECONDS) * 1000;
 const PER_HANDLE_PAUSE_MS = 700; // friendly spacing
 const JITTER_MS = 10_000;        // ±10s jitter
 const MAX_ITEMS_PER_HANDLE = Number(cfg.maxItemsPerHandle || 8); // cap per cycle
+const CAPTION_MAX = 1000; // safe caption size for image messages
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const SEEN_FILE = path.join(__dirname, "seen.json");
@@ -129,7 +130,7 @@ async function fetchNitterRSS(handle) {
   throw lastErr || new Error("All Nitter RSS mirrors failed");
 }
 
-// 2) HTML timeline fallback
+// 2) HTML timeline fallback (+ Markdown harvest)
 async function fetchNitterHTML(handle) {
   const user = handleToUser(handle);
   let lastErr;
@@ -139,14 +140,14 @@ async function fetchNitterHTML(handle) {
       const body = await fetchTextSmart(url, base);
       if (looksLikeWhitelistBlock(body) || looksLikeRateLimit(body)) throw new Error("Mirror refused");
 
-      // If proxy returned Markdown, harvest status links from Markdown and then fetch per status time/text
+      // If proxy returned Markdown, harvest status links, then fetch per-status OG for text+image+time
       if (/Markdown Content:/i.test(body)) {
         const mdLinks = extractStatusLinksMD(body).slice(0, MAX_ITEMS_PER_HANDLE);
         const items = [];
         for (const abs of mdLinks) {
-          const text = await getTweetTextFromStatus(abs);
+          const og = await fetchStatusViaOG(abs);
           const ts = await getTweetTimeFromStatus(abs);
-          if (text) items.push({ link: abs, content: text, _ts: ts || null });
+          if (og.text) items.push({ link: abs, content: og.text, _ts: ts || null, _image: og.image || null });
           await sleep(300);
         }
         if (items.length) return { items };
@@ -178,9 +179,17 @@ async function fetchSyndication(handle) {
     const text = htmlToText(textEl.toString());
     if (!text) continue;
     const nitterLink = `https://nitter.net/${user}/status/${id}`;
-    // try to read time from status page (fast; one request)
     const ts = await getTweetTimeFromStatus(nitterLink);
-    items.push({ link: nitterLink, content: text, _ts: ts || null });
+
+    // Try image from the widget markup
+    let img = null;
+    const imgEl = node.querySelector("img");
+    if (imgEl) {
+      img = imgEl.getAttribute("src") || imgEl.getAttribute("data-src") || null;
+      if (img && img.startsWith("//")) img = "https:" + img;
+    }
+
+    items.push({ link: nitterLink, content: text, _ts: ts || null, _image: img });
     await sleep(250);
   }
   if (!items.length) throw new Error("Syndication returned no tweets");
@@ -226,13 +235,23 @@ function parseNitterHTML(html, base) {
     let abs = href;
     if (abs.startsWith("/")) abs = base + abs;
 
-    // Try to read the timestamp from the anchor title (Nitter puts UTC there)
+    // Timestamp from anchor title (UTC)
     const tsTitle = (linkEl.getAttribute("title") || "").trim() || null;
+
+    // First image (if present)
+    let img = null;
+    const imgEl = node.querySelector("a.still-image img") || node.querySelector("img");
+    if (imgEl) {
+      let src = imgEl.getAttribute("src");
+      if (src && src.startsWith("/")) src = base + src;
+      img = src || null;
+    }
 
     items.push({
       link: abs,
       content: text,
-      _ts: tsTitle
+      _ts: tsTitle,
+      _image: img
     });
   }
 
@@ -263,24 +282,24 @@ function extractStatusLinksMD(markdownText) {
   return [...links];
 }
 
-// Read tweet text from a single status page (uses OG description)
-async function getTweetTextFromStatus(absUrl) {
+// Read tweet text + image from a single status page (via OG meta)
+async function fetchStatusViaOG(absUrl) {
   const body = await fetchTextSmart(absUrl);
   const root = htmlParse(body);
   const ogDesc = root.querySelector('meta[property="og:description"]')?.getAttribute("content") || "";
-  return he.decode(ogDesc).trim();
+  let ogImg = root.querySelector('meta[property="og:image"]')?.getAttribute("content") || null;
+  if (ogImg && ogImg.startsWith("//")) ogImg = "https:" + ogImg;
+  return { text: he.decode(ogDesc).trim(), image: ogImg };
 }
 
-// Read a human timestamp from a status page (prefers UTC title; formats to IST if parsable)
+// Read a human timestamp from a status page (prefers UTC title; format to IST if possible)
 async function getTweetTimeFromStatus(absUrl) {
   const body = await fetchTextSmart(absUrl);
   const root = htmlParse(body);
-  // Nitter: <span class="tweet-date"><a ... title="Aug 10, 2025 11:42 AM UTC">1h</a></span>
   const a = root.querySelector('.tweet-date a[title]') || root.querySelector('a[title*="UTC"]') || root.querySelector('a[title]');
   const raw = (a && a.getAttribute("title")) ? a.getAttribute("title").trim() : null;
   if (!raw) return null;
-  // Try to parse to Date and convert to IST; otherwise return raw
-  const parsed = Date.parse(raw.replace(/\uFFFD/g, "")); // strip odd chars if present
+  const parsed = Date.parse(raw.replace(/\uFFFD/g, ""));
   if (!isNaN(parsed)) return formatIST(new Date(parsed));
   return raw;
 }
@@ -348,7 +367,6 @@ function formatIST(d) {
 
 // Build a display time for an item: RSS → IST; HTML → title; Syndication/status → parsed IST if possible
 async function getDisplayTime(item) {
-  // rss-parser enriches with isoDate
   if (item.isoDate) {
     const d = new Date(item.isoDate);
     if (!isNaN(d)) return formatIST(d);
@@ -356,13 +374,23 @@ async function getDisplayTime(item) {
   if (item._ts) {
     const parsed = Date.parse(item._ts.replace(/\uFFFD/g, ""));
     if (!isNaN(parsed)) return formatIST(new Date(parsed));
-    return item._ts; // raw (likely UTC string)
+    return item._ts; // raw (likely UTC)
   }
   if (item.link && item.link.includes("/status/")) {
     const ts = await getTweetTimeFromStatus(item.link);
     if (ts) return ts;
   }
-  return ""; // as a last resort, no time
+  return "";
+}
+
+// Pick an image url from the item (supports HTML, RSS, Syndication, Markdown OG)
+function pickImage(item) {
+  if (item._image) return item._image;
+  if (item.enclosure && item.enclosure.url) return item.enclosure.url;
+  if (item.enclosures && item.enclosures[0] && item.enclosures[0].url) return item.enclosures[0].url;
+  const html = item["content:encoded"] || item.content || "";
+  const m = html.match(/<img[^>]+src="([^"]+)"/i);
+  return m ? m[1] : null;
 }
 
 // ---------- WhatsApp helpers ----------
@@ -376,10 +404,27 @@ async function getChatIdByName(client, name) {
   throw new Error(`WhatsApp chat named "${name}" not found. Create a group named exactly ${name}.`);
 }
 
-async function sendText(client, chatId, label, timeStr, text) {
-  const MAX = 4000;
+async function sendToWhatsApp(client, chatId, label, timeStr, text, imageUrl) {
   const timeLine = timeStr ? `${timeStr}\n\n` : "";
-  const body = `${label}:\n${timeLine}${text}`.slice(0, MAX);
+  const body = `${label}:\n${timeLine}${text}`;
+
+  if (imageUrl) {
+    try {
+      const media = await MessageMedia.fromUrl(imageUrl, { unsafeMime: true });
+      // If caption too long, split: short caption + full text separately
+      if (body.length > CAPTION_MAX) {
+        const shortCap = `${label}:\n${timeStr || ""}`.trim();
+        await client.sendMessage(chatId, media, { caption: shortCap });
+        await client.sendMessage(chatId, text, { linkPreview: false });
+      } else {
+        await client.sendMessage(chatId, media, { caption: body });
+      }
+      return;
+    } catch (e) {
+      console.log("Image send failed, sending text only:", e.message);
+    }
+  }
+
   await client.sendMessage(chatId, body, { linkPreview: false });
 }
 
@@ -402,10 +447,10 @@ async function pollOnce(client, chatId) {
         if (!text) { seen[key] = true; changed = true; continue; }
 
         const label = (cfg.labels && cfg.labels[handle]) || handle.replace(/^@/, "");
-
         const timeStr = await getDisplayTime(item);
+        const imageUrl = pickImage(item);
 
-        await sendText(client, chatId, label, timeStr, text);
+        await sendToWhatsApp(client, chatId, label, timeStr, text, imageUrl);
 
         seen[key] = true;
         changed = true;
